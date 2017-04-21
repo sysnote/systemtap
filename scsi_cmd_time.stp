@@ -1,0 +1,121 @@
+#! /usr/bin/env stap
+
+/*
+ * Copyright (C) 2016-2017 Wu Dong
+ *
+ * This copyrighted material is made available to anyone wishing to use,
+ * modify, copy, or redistribute it subject to the terms and conditions
+ * of the GNU General Public License v.2.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Print out every scsi cmd's excute time.
+ * Usage: sudo stap -g scsi_cmd_time.stp
+ *
+ * Output format is:
+ * sdb 0:2:1:0 lba=18809520 txlen=8, use time:69us
+ * sdb 0:2:1:0 lba=18804472 txlen=8, use time:34us
+ * sda 0:2:0:0 lba=8652800 txlen=24, use time:50us
+ */
+
+%{
+#include <linux/types.h>
+#include <scsi/scsi.h>
+#include <scsi/scsi_cmnd.h>
+%}
+
+global scsitime
+
+function scsi_parse_cdb:string (cmd:long) %{
+    struct scsi_cmnd *sc = (struct scsi_cmnd *)((long)STAP_ARG_cmd);
+    sector_t lba = 0, txlen = 0;
+    switch (sc->cmnd[0]) {
+        case READ_6:
+        case WRITE_6:
+            lba |= ((sc->cmnd[1] & 0x1F) << 16);
+            lba |=  (sc->cmnd[2] << 8);
+            lba |=   sc->cmnd[3];
+            txlen = sc->cmnd[4];
+            snprintf(STAP_RETVALUE, MAXSTRINGLEN, "lba=%llu txlen=%llu", 
+                (unsigned long long)lba, (unsigned long long)txlen);
+            break;
+        case READ_10:
+        case VERIFY:
+        case WRITE_10:
+        case WRITE_SAME:
+            lba |= (sc->cmnd[2] << 24);
+            lba |= (sc->cmnd[3] << 16);
+            lba |= (sc->cmnd[4] << 8);
+            lba |=  sc->cmnd[5];
+            txlen |= (sc->cmnd[7] << 8);
+            txlen |=  sc->cmnd[8];
+            snprintf(STAP_RETVALUE, MAXSTRINGLEN, "lba=%llu txlen=%llu", 
+                (unsigned long long)lba, (unsigned long long)txlen);
+            break;
+        case READ_12:
+        case VERIFY_12:
+        case WRITE_12:
+            lba |= (sc->cmnd[2] << 24);
+            lba |= (sc->cmnd[3] << 16);
+            lba |= (sc->cmnd[4] << 8);
+            lba |=  sc->cmnd[5];
+            txlen |= (sc->cmnd[6] << 24);
+            txlen |= (sc->cmnd[7] << 16);
+            txlen |= (sc->cmnd[8] << 8);
+            txlen |=  sc->cmnd[9];
+            snprintf(STAP_RETVALUE, MAXSTRINGLEN, "lba=%llu txlen=%llu", 
+                (unsigned long long)lba, (unsigned long long)txlen);
+            break;
+        case READ_16:
+        case VERIFY_16:
+        case WRITE_16:
+        case WRITE_SAME_16:
+            lba |= ((u64)sc->cmnd[2] << 56);
+            lba |= ((u64)sc->cmnd[3] << 48);
+            lba |= ((u64)sc->cmnd[4] << 40);
+            lba |= ((u64)sc->cmnd[5] << 32);
+            lba |= (sc->cmnd[6] << 24);
+            lba |= (sc->cmnd[7] << 16);
+            lba |= (sc->cmnd[8] << 8);
+            lba |=  sc->cmnd[9];
+            txlen |= (sc->cmnd[10] << 24);
+            txlen |= (sc->cmnd[11] << 16);
+            txlen |= (sc->cmnd[12] << 8);
+            txlen |=  sc->cmnd[13];
+            snprintf(STAP_RETVALUE, MAXSTRINGLEN, "lba=%llu txlen=%llu", 
+                (unsigned long long)lba, (unsigned long long)txlen);
+            break;
+        case UNMAP:
+        case SERVICE_ACTION_IN:
+        case VARIABLE_LENGTH_CMD:
+        default:
+            snprintf(STAP_RETVALUE, MAXSTRINGLEN, "%s", "unknown");
+    }   
+%}
+
+probe module("scsi_mod").function("scsi_dispatch_cmd") {
+    devname = kernel_string($cmd->request->rq_disk->disk_name)
+        host_no = $cmd->device->host->host_no
+        channel = $cmd->device->channel
+        lun = $cmd->device->lun
+        dev_id = $cmd->device->id
+    lba_len = scsi_parse_cdb($cmd)
+    scsitime[host_no, channel, lun, dev_id, lba_len] = gettimeofday_us()    
+}
+
+probe module("scsi_mod").function("scsi_done") {
+    devname = kernel_string($cmd->request->rq_disk->disk_name)
+        host_no = $cmd->device->host->host_no
+        channel = $cmd->device->channel
+        lun = $cmd->device->lun
+        dev_id = $cmd->device->id
+    lba_len = scsi_parse_cdb($cmd)
+    if ([host_no, channel, lun, dev_id, lba_len] in scsitime) {
+        endtime = gettimeofday_us()
+        cmdtime = endtime - scsitime[host_no, channel, lun, dev_id, lba_len]
+        printf("%s %d:%d:%d:%d %s, use time:%dus\n", devname, host_no, channel, dev_id, lun, lba_len, cmdtime)
+        delete scsitime[host_no, channel, lun, dev_id, lba_len]
+    }
+}
+
